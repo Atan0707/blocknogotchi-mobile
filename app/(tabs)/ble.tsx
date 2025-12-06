@@ -1,4 +1,5 @@
 import { requestPermissions } from "@/hooks/useBLE";
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import { Buffer } from "buffer";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Alert, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from "react-native";
@@ -25,6 +26,7 @@ export default function BLEScreen() {
     const [writeValue, setWriteValue] = useState<string>("");
     const [showAllDevices, setShowAllDevices] = useState<boolean>(false); // Debug mode
     const [allDevices, setAllDevices] = useState<Device[]>([]); // All scanned devices for debugging
+    const [savedDevices, setSavedDevices] = useState<{id: string, name: string, isConnected: boolean}[]>([]); // Saved/known devices
 
     // Initialize BLE manager after mount
     useEffect(() => {
@@ -44,6 +46,22 @@ export default function BLEScreen() {
         };
     }, []);
 
+    // Load saved devices on mount
+    useEffect(() => {
+        const loadSavedDevices = async () => {
+            try {
+                const saved = await AsyncStorage.getItem("savedBLEDevices");
+                if (saved) {
+                    const parsed = JSON.parse(saved);
+                    setSavedDevices(parsed);
+                }
+            } catch (error) {
+                console.error("Failed to load saved devices:", error);
+            }
+        };
+        loadSavedDevices();
+    }, []);
+
     // Request permissions on mount
     useEffect(() => {
         const checkPermissions = async () => {
@@ -58,6 +76,45 @@ export default function BLEScreen() {
         };
         checkPermissions();
     }, []);
+
+    // Note: Connection status is updated when connecting/disconnecting
+    // We can't reliably check connection status without scanning
+
+    // Save device to saved list
+    const saveDevice = useCallback(async (device: Device) => {
+        const deviceInfo = {
+            id: device.id,
+            name: device.name || "Unknown Device",
+            isConnected: false,
+        };
+
+        const updated = [...savedDevices];
+        const existingIndex = updated.findIndex(d => d.id === device.id);
+        
+        if (existingIndex >= 0) {
+            updated[existingIndex] = { ...updated[existingIndex], name: deviceInfo.name };
+        } else {
+            updated.push(deviceInfo);
+        }
+
+        setSavedDevices(updated);
+        try {
+            await AsyncStorage.setItem("savedBLEDevices", JSON.stringify(updated));
+        } catch (error) {
+            console.error("Failed to save device:", error);
+        }
+    }, [savedDevices]);
+
+    // Remove device from saved list
+    const removeSavedDevice = useCallback(async (deviceId: string) => {
+        const updated = savedDevices.filter(d => d.id !== deviceId);
+        setSavedDevices(updated);
+        try {
+            await AsyncStorage.setItem("savedBLEDevices", JSON.stringify(updated));
+        } catch (error) {
+            console.error("Failed to remove device:", error);
+        }
+    }, [savedDevices]);
 
     const startScan = useCallback(() => {
         if (!permissionsGranted) {
@@ -166,11 +223,23 @@ export default function BLEScreen() {
             const connected = await device.connect();
             setConnectedDevice(connected);
 
+            // Save device to saved list
+            await saveDevice(device);
+
+            // Update saved devices connection status
+            setSavedDevices(prev => prev.map(d => 
+                d.id === device.id ? { ...d, isConnected: true } : { ...d, isConnected: false }
+            ));
+
             // Set up disconnection listener
             connected.onDisconnected(() => {
                 setConnectedDevice(null);
                 setServices([]);
                 setCharacteristics([]);
+                // Update saved devices connection status
+                setSavedDevices(prev => prev.map(d => 
+                    d.id === device.id ? { ...d, isConnected: false } : d
+                ));
                 Alert.alert("Disconnected", "Device disconnected");
             });
 
@@ -203,7 +272,7 @@ export default function BLEScreen() {
         } finally {
             setIsConnecting(false);
         }
-    }, [bleManager]);
+    }, [bleManager, saveDevice]);
 
     // Disconnect from device
     const disconnectDevice = useCallback(async () => {
@@ -215,11 +284,35 @@ export default function BLEScreen() {
                 setCharacteristics([]);
                 setReadValue("");
                 setWriteValue("");
+                // Update saved devices connection status
+                setSavedDevices(prev => prev.map(d => 
+                    d.id === connectedDevice.id ? { ...d, isConnected: false } : d
+                ));
             } catch (error: any) {
                 Alert.alert("Error", error.message || "Failed to disconnect");
             }
         }
     }, [connectedDevice]);
+
+    // Connect to saved device by ID (requires device to be in scanned list)
+    const connectToSavedDevice = useCallback(async (deviceId: string) => {
+        if (!bleManager) {
+            Alert.alert("Error", "BLE Manager not initialized");
+            return;
+        }
+
+        // Try to find device in currently scanned devices
+        const foundDevice = [...devices, ...allDevices].find(d => d.id === deviceId);
+        
+        if (foundDevice) {
+            await connectToDevice(foundDevice);
+        } else {
+            Alert.alert(
+                "Device Not Found", 
+                "Device is not in range. Please scan for devices first, then try connecting."
+            );
+        }
+    }, [bleManager, connectToDevice, devices, allDevices]);
 
     // Read from characteristic
     const readCharacteristic = useCallback(async () => {
@@ -314,6 +407,52 @@ export default function BLEScreen() {
                         </TouchableOpacity>
                     </View>
 
+                    {/* Saved Devices Section */}
+                    {savedDevices.length > 0 && (
+                        <View style={styles.savedSection}>
+                            <Text style={styles.sectionTitle}>Saved Devices ({savedDevices.length})</Text>
+                            {savedDevices.map((saved) => (
+                                <View key={saved.id} style={styles.deviceCard}>
+                                    <View style={styles.deviceHeader}>
+                                        <View style={styles.deviceInfo}>
+                                            <Text style={styles.deviceName}>{saved.name}</Text>
+                                            <Text style={styles.deviceId}>ID: {saved.id}</Text>
+                                        </View>
+                                        <View style={styles.statusBadge}>
+                                            <View style={[
+                                                styles.statusDot, 
+                                                saved.isConnected ? styles.statusConnected : styles.statusDisconnected
+                                            ]} />
+                                            <Text style={[
+                                                styles.statusText,
+                                                saved.isConnected ? styles.statusTextConnected : styles.statusTextDisconnected
+                                            ]}>
+                                                {saved.isConnected ? "Connected" : "Disconnected"}
+                                            </Text>
+                                        </View>
+                                    </View>
+                                    <View style={styles.deviceActions}>
+                                        <TouchableOpacity
+                                            style={[styles.actionButton, saved.isConnected && styles.buttonDisabled]}
+                                            onPress={() => connectToSavedDevice(saved.id)}
+                                            disabled={saved.isConnected || isConnecting}
+                                        >
+                                            <Text style={styles.buttonText}>
+                                                {saved.isConnected ? "Connected" : "Connect"}
+                                            </Text>
+                                        </TouchableOpacity>
+                                        <TouchableOpacity
+                                            style={[styles.actionButton, styles.buttonRemove]}
+                                            onPress={() => removeSavedDevice(saved.id)}
+                                        >
+                                            <Text style={styles.buttonText}>Remove</Text>
+                                        </TouchableOpacity>
+                                    </View>
+                                </View>
+                            ))}
+                        </View>
+                    )}
+
                     <View style={styles.devicesHeader}>
                         <View style={styles.headerRow}>
                             <Text style={styles.devicesTitle}>
@@ -358,32 +497,62 @@ export default function BLEScreen() {
                                         uuid => uuid.toLowerCase() === SERVICE_UUID.toLowerCase()
                                     ));
                                 
+                                const isSaved = savedDevices.some(d => d.id === device.id);
+                                const savedDeviceInfo = savedDevices.find(d => d.id === device.id);
+                                // Note: connectedDevice is null in this block, so we only check saved device status
+                                const isCurrentlyConnected = savedDeviceInfo ? savedDeviceInfo.isConnected : false;
+
                                 return (
                                 <View key={device.id} style={styles.deviceCard}>
-                                    <Text style={styles.deviceName}>
-                                        {device.name || "Unknown Device"}
-                                    </Text>
-                                    <Text style={styles.deviceId}>ID: {device.id}</Text>
-                                    {device.rssi && (
-                                        <Text style={styles.deviceRssi}>
-                                            RSSI: {device.rssi} dBm
-                                        </Text>
-                                    )}
+                                    <View style={styles.deviceHeader}>
+                                        <View style={styles.deviceInfo}>
+                                            <Text style={styles.deviceName}>
+                                                {device.name || "Unknown Device"}
+                                            </Text>
+                                            <Text style={styles.deviceId}>ID: {device.id}</Text>
+                                            {device.rssi && (
+                                                <Text style={styles.deviceRssi}>
+                                                    RSSI: {device.rssi} dBm
+                                                </Text>
+                                            )}
+                                            {isSaved && (
+                                                <Text style={styles.savedBadge}>Saved</Text>
+                                            )}
+                                        </View>
+                                        {isCurrentlyConnected && (
+                                            <View style={styles.statusBadge}>
+                                                <View style={[styles.statusDot, styles.statusConnected]} />
+                                                <Text style={[styles.statusText, styles.statusTextConnected]}>
+                                                    Connected
+                                                </Text>
+                                            </View>
+                                        )}
+                                    </View>
                                     {device.manufacturerData && (
                                         <Text style={styles.deviceData}>
                                             Manufacturer Data: {device.manufacturerData}
                                         </Text>
                                     )}
                                     {isRaspberryPi ? (
-                                        <TouchableOpacity
-                                            style={styles.connectButton}
-                                            onPress={() => connectToDevice(device)}
-                                            disabled={isConnecting}
-                                        >
-                                            <Text style={styles.buttonText}>
-                                                {isConnecting ? "Connecting..." : "Connect"}
-                                            </Text>
-                                        </TouchableOpacity>
+                                        <View style={styles.deviceActions}>
+                                            <TouchableOpacity
+                                                style={[styles.connectButton, isCurrentlyConnected && styles.buttonDisabled]}
+                                                onPress={() => connectToDevice(device)}
+                                                disabled={isConnecting || isCurrentlyConnected}
+                                            >
+                                                <Text style={styles.buttonText}>
+                                                    {isCurrentlyConnected ? "Connected" : isConnecting ? "Connecting..." : "Connect"}
+                                                </Text>
+                                            </TouchableOpacity>
+                                            {!isSaved && (
+                                                <TouchableOpacity
+                                                    style={[styles.actionButton, styles.buttonSave]}
+                                                    onPress={() => saveDevice(device)}
+                                                >
+                                                    <Text style={styles.buttonText}>Save</Text>
+                                                </TouchableOpacity>
+                                            )}
+                                        </View>
                                     ) : showAllDevices ? (
                                         <Text style={styles.notPiText}>Not a Raspberry Pi</Text>
                                     ) : null}
@@ -549,16 +718,65 @@ const styles = StyleSheet.create({
         marginTop: 40,
         fontSize: 16,
     },
+    savedSection: {
+        marginBottom: 20,
+    },
     deviceCard: {
         backgroundColor: "#F5F5F5",
         padding: 16,
         borderRadius: 8,
         marginBottom: 12,
     },
+    deviceHeader: {
+        flexDirection: "row",
+        justifyContent: "space-between",
+        alignItems: "flex-start",
+        marginBottom: 8,
+    },
+    deviceInfo: {
+        flex: 1,
+    },
     deviceName: {
         fontSize: 16,
         fontWeight: "600",
         marginBottom: 4,
+    },
+    savedBadge: {
+        fontSize: 10,
+        color: "#007AFF",
+        fontWeight: "600",
+        marginTop: 4,
+    },
+    statusBadge: {
+        flexDirection: "row",
+        alignItems: "center",
+        gap: 6,
+    },
+    statusDot: {
+        width: 8,
+        height: 8,
+        borderRadius: 4,
+    },
+    statusConnected: {
+        backgroundColor: "#34C759",
+    },
+    statusDisconnected: {
+        backgroundColor: "#8E8E93",
+    },
+    statusText: {
+        fontSize: 12,
+        fontWeight: "600",
+    },
+    statusTextConnected: {
+        color: "#34C759",
+    },
+    statusTextDisconnected: {
+        color: "#8E8E93",
+    },
+    deviceActions: {
+        flexDirection: "row",
+        gap: 8,
+        marginTop: 8,
     },
     deviceId: {
         fontSize: 12,
@@ -580,8 +798,14 @@ const styles = StyleSheet.create({
         backgroundColor: "#34C759",
         padding: 10,
         borderRadius: 6,
-        marginTop: 8,
+        flex: 1,
         alignItems: "center",
+    },
+    buttonSave: {
+        backgroundColor: "#007AFF",
+    },
+    buttonRemove: {
+        backgroundColor: "#FF3B30",
     },
     buttonDanger: {
         backgroundColor: "#FF3B30",
